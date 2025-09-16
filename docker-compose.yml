@@ -1,0 +1,148 @@
+version: '3'
+
+services:
+  search_api:
+    build: ./search_api
+    ports:
+      - "8000:8000"
+    environment:
+      # API connection settings
+      - EMBEDDING_MODEL=deepvk/USER-bge-m3
+      - EXCEL_PATH=/data/qa_database.xlsx
+      # Hugging Face cache configuration
+      - HF_HOME=/cache/huggingface
+      # Milvus hybrid search settings
+      - MILVUS_URI=${MILVUS_URI:-http://milvus-standalone:19530}
+      - MILVUS_ENABLE_HYBRID_SEARCH=${MILVUS_ENABLE_HYBRID_SEARCH:-True}
+      - MILVUS_ANALYZER_PARAMS=${MILVUS_ANALYZER_PARAMS:-}
+    volumes:
+      - ./search_api:/app
+      - ./data:/data
+      - ./volumes/huggingface_cache:/cache/huggingface
+    networks:
+      - rag-network
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+    depends_on:
+      - milvus-standalone
+
+  api:
+    build: ./api
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./api:/app
+    environment:
+      - SEARCH_URL=http://search_api:8000
+      # LLM Configuration - Uncomment and configure ONE of the following options:
+
+      # Option 1: OpenAI API
+      # - OPENAI_API_KEY=your_openai_api_key
+      # - LLM_MODEL=gpt-3.5-turbo
+
+      # Option 2: Custom LLM API endpoint (Local LMStudio)
+      - LLM_URL=http://host.docker.internal:1234/v1
+      - LLM_MODEL=gemma-3-12b-it-qat
+    networks:
+      - rag-network
+    depends_on:
+      - search_api
+
+  telegram_bot:
+    build: ./telegram_bot
+    volumes:
+      - ./telegram_bot:/app
+      - ./volumes/telegram_logs:/app/logs
+    environment:
+      - TELEGRAM_TOKEN=${TELEGRAM_TOKEN}
+      - SEARCH_URL=http://search_api:8000
+      - LOG_DIR=/app/logs
+      # LLM Configuration - Use the same configuration as the API service
+      # Option 1: OpenAI API
+      # - OPENAI_API_KEY=your_openai_api_key
+      # - LLM_MODEL=gpt-3.5-turbo
+
+      # Option 2: Custom LLM API endpoint
+      - LLM_URL=http://host.docker.internal:1234/v1
+      - LLM_MODEL=gemma-3-12b-it-qat
+    networks:
+      - rag-network
+    depends_on:
+      - search_api
+    restart: unless-stopped
+
+  # Milvus vector database services
+  etcd:
+    container_name: milvus-etcd
+    image: quay.io/coreos/etcd:v3.5.5
+    environment:
+      ETCD_AUTO_COMPACTION_MODE: ${ETCD_AUTO_COMPACTION_MODE:-revision}
+      ETCD_AUTO_COMPACTION_RETENTION: ${ETCD_AUTO_COMPACTION_RETENTION:-1000}
+      ETCD_QUOTA_BACKEND_BYTES: ${ETCD_QUOTA_BACKEND_BYTES:-4294967296}
+      ETCD_SNAPSHOT_COUNT: ${ETCD_SNAPSHOT_COUNT:-50000}
+    volumes:
+      - ./volumes/milvus/etcd:/etcd
+    command: etcd -advertise-client-urls=http://127.0.0.1:2379 -listen-client-urls http://0.0.0.0:2379 --data-dir /etcd
+    healthcheck:
+      test: [ 'CMD', 'etcdctl', 'endpoint', 'health' ]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+    networks:
+      - rag-network
+    profiles:
+      - milvus
+
+
+  minio:
+    container_name: milvus-minio
+    image: minio/minio:RELEASE.2023-03-20T20-16-18Z
+    environment:
+      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY:-minioadmin}
+      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY:-minioadmin}
+    volumes:
+      - ./volumes/milvus/minio:/minio_data
+    command: minio server /minio_data --console-address ":9001"
+    healthcheck:
+      test: [ 'CMD', 'curl', '-f', 'http://localhost:9000/minio/health/live' ]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+    networks:
+      - rag-network
+    profiles:
+      - milvus
+
+  milvus-standalone:
+    container_name: milvus-standalone
+    image: milvusdb/milvus:v2.5.10
+    command: [ 'milvus', 'run', 'standalone' ]
+    environment:
+      ETCD_ENDPOINTS: ${ETCD_ENDPOINTS:-etcd:2379}
+      MINIO_ADDRESS: ${MINIO_ADDRESS:-minio:9000}
+      common.security.authorizationEnabled: ${MILVUS_AUTHORIZATION_ENABLED:-false}
+    volumes:
+      - ./volumes/milvus/milvus:/var/lib/milvus
+    healthcheck:
+      test: [ 'CMD', 'curl', '-f', 'http://localhost:9091/healthz' ]
+      interval: 30s
+      start_period: 90s
+      timeout: 20s
+      retries: 3
+    depends_on:
+      - etcd
+      - minio
+    ports:
+      - 19530:19530
+      - 9091:9091
+    networks:
+      - rag-network
+    profiles:
+      - milvus
+
+networks:
+  rag-network:
+    driver: bridge
+

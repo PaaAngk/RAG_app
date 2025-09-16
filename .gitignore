@@ -1,0 +1,4 @@
+volumes
+data/*.xlsx
+data/*.md
+.env
